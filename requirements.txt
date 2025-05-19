@@ -4,3 +4,4 @@ openai
 elevenlabs
 websockets
 gunicorn
+pydub
