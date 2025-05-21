@@ -10,28 +10,32 @@ from pydub import AudioSegment
 import openai
 from elevenlabs import ElevenLabs
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g., your-app.onrender.com
+# Initialize OpenAI and ElevenLabs clients
+openai.api_key = os.getenv("OPENAI_API_KEY")
+elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
-openai.api_key = OPENAI_API_KEY
-elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
+# Flask app setup
 app = Flask(__name__)
 sock = Sock(app)
 
+# Constants
 SAMPLE_RATE = 8000
 CHANNELS = 1
-
 ELEVEN_VOICE = "bVMeCyTHy58xNoL34h3p"
 ELEVEN_MODEL = "eleven_flash_v2"
+TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")
 
-SYSTEM_PROMPT = {"role": "system", "content": (
-    "Du ringer ett cold call och ska sälja en höbal. "
-    "Du ringer från Theos höbalar AB och du heter Mohammed. "
-    "Sälj den för två hundra tusen kronor."
-)}
+# System prompt for the AI
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": (
+        "Du ringer ett cold call och ska sälja en höbal. "
+        "Du ringer från Theos höbalar AB och du heter Mohammed. "
+        "Sälj den för två hundra tusen kronor."
+    )
+}
 
+# Dictionary to hold conversation histories
 conversations = {}
 
 @app.route("/health")
@@ -95,12 +99,12 @@ async def transcribe(wav_bytes):
 
 async def chatgpt_reply(conv):
     try:
-        res = openai.ChatCompletion.create(
+        res = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=conv,
             temperature=0.7,
         )
-        return res["choices"][0]["message"]["content"]
+        return res.choices[0].message.content
     except Exception as e:
         print("GPT error:", e)
         return "Jag kan inte svara just nu."
@@ -126,6 +130,19 @@ def ws(ws):
         if not call_sid and packet.get("start"):
             call_sid = packet["start"]["callSid"]
             conversations[call_sid] = [SYSTEM_PROMPT]
+
+            # Simulate "hej" as first message
+            conversations[call_sid].append({"role": "user", "content": "hej"})
+            reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
+            conversations[call_sid].append({"role": "assistant", "content": reply})
+
+            # Send TTS reply
+            for chunk in tts_stream(reply):
+                seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+                seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
+                mu = pcm_to_ulaw(seg2.raw_data)
+                b64 = base64.b64encode(mu).decode()
+                ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
             continue
 
         media = packet.get("media")
