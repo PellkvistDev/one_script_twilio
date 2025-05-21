@@ -1,177 +1,135 @@
 import os
 import asyncio
-import websockets
 import base64
-import audioop
-import io
 import json
-from pydub import AudioSegment
-import openai
-from elevenlabs import ElevenLabs, stream as tts_stream
+import io
 
-# Load environment variables (set these in Render)
+from flask import Flask, request
+from flask_sock import Sock
+from pydub import AudioSegment
+import audioop
+import openai
+from elevenlabs import ElevenLabs
+
+# Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-
-# Initialize clients
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Eller ersätt med din nyckel direkt
-elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-
-# Constants for audio format
+ELEVENLABS_VOICE = "bVMeCyTHy58xNoL34h3p"
+ELEVENLABS_MODEL = "eleven_flash_v2"
 SAMPLE_RATE = 8000
 CHANNELS = 1
 
-# Buffers for audio chunks per call
-calls_audio_buffer = {}
+# Initialize Flask app and Flask-Sock
+app = Flask(__name__)
+sock = Sock(app)
 
-# Your ElevenLabs voice and model for TTS
-ELEVENLABS_VOICE = "bVMeCyTHy58xNoL34h3p"  # Replace with your voice ID
-ELEVENLABS_MODEL = "eleven_flash_v2"
+# Initialize OpenAI and ElevenLabs
+openai.api_key = OPENAI_API_KEY
+elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# System prompt for ChatGPT
+# System message for ChatGPT
 SYSTEM_PROMPT = {
     "role": "system",
     "content": "Du ringer ett cold call och ska sälja en höbal. Du ringer från Theos höbalar AB och du heter Mohammed. Sälj den för två hundra tusen kronor."
 }
 
-# Store conversation states per call
 conversations = {}
 
-async def transcribe_audio(wav_bytes):
-    # Transcribe audio bytes with Whisper API (wav bytes)
-    try:
-        audio_file = io.BytesIO(wav_bytes)
-        transcript = client.Audio.transcribe("whisper-1", audio_file)
-        return transcript["text"]
-    except Exception as e:
-        print("Whisper transcribe error:", e)
-        return ""
+@app.route("/")
+def index():
+    return "Server is running."
 
-async def get_chatgpt_response(conversation):
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=conversation,
-            temperature=0.7
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        print("ChatGPT error:", e)
-        return "Jag har problem med att svara just nu."
-
-async def generate_tts_stream(text):
-    # Use ElevenLabs to generate streaming audio from text
-    audio_stream = elevenlabs_client.generate(
-        text=text,
-        voice=ELEVENLABS_VOICE,
-        model=ELEVENLABS_MODEL,
-        stream=True,
-    )
-    return audio_stream
-
-def mu_law_to_pcm(raw_audio):
-    # Convert raw μ-law bytes to 16-bit PCM (mono)
-    pcm = audioop.ulaw2lin(raw_audio, 2)  # 16-bit samples
-    return pcm
-
-def pcm_to_mu_law(pcm_audio):
-    # Convert 16-bit PCM bytes to μ-law bytes
-    mu = audioop.lin2ulaw(pcm_audio, 2)
-    return mu
-
-async def handler(websocket, path):
-    """
-    Handle WebSocket connection from Twilio.
-
-    Twilio sends JSON messages with "media" key containing
-    base64-encoded μ-law 8kHz audio.
-    """
+@sock.route("/ws")
+def ws_handler(ws):
     call_sid = None
     audio_buffer = bytearray()
-    last_transcription_time = 0
-    conversation = [SYSTEM_PROMPT]
-
-    print("Client connected")
 
     try:
-        async for message in websocket:
+        while True:
+            message = ws.receive()
+            if message is None:
+                break
+
             data = json.loads(message)
 
-            # Identify call SID
+            # Start event
             if not call_sid and "start" in data:
-                call_sid = data["start"]["callSid"]
-                print(f"Call SID: {call_sid}")
+                call_sid = data["start"].get("callSid", "unknown")
                 conversations[call_sid] = [SYSTEM_PROMPT]
+                print(f"Call SID: {call_sid}")
 
-            # Media packet with audio
+            # Audio media
             if "media" in data:
-                media = data["media"]
-                encoded_audio = media["payload"]
+                encoded_audio = data["media"]["payload"]
                 raw_audio = base64.b64decode(encoded_audio)
-
-                # Convert μ-law audio to PCM
-                pcm_audio = mu_law_to_pcm(raw_audio)
+                pcm_audio = audioop.ulaw2lin(raw_audio, 2)
                 audio_buffer.extend(pcm_audio)
 
-                # Transcribe every ~5 seconds of audio
-                if len(audio_buffer) >= SAMPLE_RATE * 2 * 5:  # 5 seconds * 16000 bytes/sec (16bit mono)
+                if len(audio_buffer) >= SAMPLE_RATE * 2 * 5:
                     wav_audio = AudioSegment(
                         audio_buffer,
                         frame_rate=SAMPLE_RATE,
                         sample_width=2,
-                        channels=CHANNELS,
+                        channels=CHANNELS
                     )
-                    # Export to wav bytes
                     wav_io = io.BytesIO()
                     wav_audio.export(wav_io, format="wav")
                     wav_bytes = wav_io.getvalue()
+                    audio_buffer.clear()
 
-                    # Clear buffer for next chunk
-                    audio_buffer = bytearray()
+                    # Transcribe
+                    transcript = transcribe_audio(wav_bytes)
+                    print(f"User: {transcript}")
+                    if transcript.strip():
+                        conversations[call_sid].append({"role": "user", "content": transcript})
 
-                    # Transcribe speech to text
-                    transcription = await transcribe_audio(wav_bytes)
-                    if transcription.strip():
-                        print(f"Transcribed: {transcription}")
-                        conversations[call_sid].append({"role": "user", "content": transcription})
-
-                        # Get ChatGPT response
-                        reply = await get_chatgpt_response(conversations[call_sid])
+                        # Get response
+                        reply = get_chatgpt_response(conversations[call_sid])
                         conversations[call_sid].append({"role": "assistant", "content": reply})
-                        print(f"ChatGPT: {reply}")
+                        print(f"Bot: {reply}")
 
-                        # Generate TTS audio stream from ElevenLabs
-                        audio_gen = await generate_tts_stream(reply)
-
-                        # Stream audio chunks back to Twilio
-                        async for chunk in audio_gen:
-                            # chunk is bytes of mp3 audio, decode and convert to μ-law 8kHz pcm
+                        # TTS
+                        for chunk in generate_tts_stream(reply):
                             segment = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                             segment = segment.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
                             pcm_bytes = segment.raw_data
-                            mu_bytes = pcm_to_mu_law(pcm_bytes)
+                            mu_bytes = audioop.lin2ulaw(pcm_bytes, 2)
                             b64_audio = base64.b64encode(mu_bytes).decode("ascii")
+                            ws.send(json.dumps({"event": "media", "media": {"payload": b64_audio}}))
 
-                            # Send JSON audio chunk back to Twilio
-                            msg = json.dumps({
-                                "event": "media",
-                                "media": {
-                                    "payload": b64_audio
-                                }
-                            })
-                            await websocket.send(msg)
+                        ws.send(json.dumps({"event": "stop"}))
+    except Exception as e:
+        print(f"WebSocket error: {e}")
 
-                        # After done sending audio reply, send "event": "stop"
-                        stop_msg = json.dumps({"event": "stop"})
-                        await websocket.send(stop_msg)
 
-    except websockets.exceptions.ConnectionClosed:
-        print("Client disconnected")
+def transcribe_audio(wav_bytes):
+    try:
+        audio_file = io.BytesIO(wav_bytes)
+        transcript = openai.Audio.transcribe("whisper-1", audio_file)
+        return transcript["text"]
+    except Exception as e:
+        print("Whisper error:", e)
+        return ""
 
-async def main():
-    print("Starting WebSocket server on port 8765")
-    async with websockets.serve(handler, "0.0.0.0", 8765):
-        await asyncio.Future()  # run forever
+def get_chatgpt_response(conversation):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=conversation,
+            temperature=0.7
+        )
+        return response["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("ChatGPT error:", e)
+        return "Jag kan inte svara just nu."
+
+def generate_tts_stream(text):
+    return elevenlabs_client.generate(
+        text=text,
+        voice=ELEVENLABS_VOICE,
+        model=ELEVENLABS_MODEL,
+        stream=True
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    app.run(host="0.0.0.0", port=10000)
