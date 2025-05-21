@@ -2,24 +2,24 @@ import os
 import io
 import json
 import base64
-import audioop
 import asyncio
+import numpy as np
 from flask import Flask, request, Response
 from flask_sock import Sock
 from pydub import AudioSegment
 import openai
 from elevenlabs import ElevenLabs
 
-# Environment variables
+# Load environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g. "your-app.onrender.com"
+TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g., "your-app.onrender.com"
 
 # Initialize clients
 openai.api_key = OPENAI_API_KEY
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# Flask + WebSocket setup
+# Flask app and WebSocket
 app = Flask(__name__)
 sock = Sock(app)
 
@@ -27,50 +27,78 @@ sock = Sock(app)
 SAMPLE_RATE = 8000
 CHANNELS = 1
 
-# ElevenLabs TTS config
+# ElevenLabs TTS settings
 ELEVEN_VOICE = "bVMeCyTHy58xNoL34h3p"
 ELEVEN_MODEL = "eleven_flash_v2"
 
-# System prompt for ChatGPT
-SYSTEM_PROMPT = {
-    "role": "system",
-    "content": (
-        "Du ringer ett cold call och ska sälja en höbal. "
-        "Du ringer från Theos höbalar AB och du heter Mohammed. "
-        "Sälj den för två hundra tusen kronor."
-    )
-}
+# System prompt
+SYSTEM_PROMPT = {"role": "system", "content": (
+    "Du ringer ett cold call och ska sälja en höbal. "
+    "Du ringer från Theos höbalar AB och du heter Mohammed. "
+    "Sälj den för två hundra tusen kronor."
+)}
 
-# Store conversations per call
+# Conversation state per call
 conversations = {}
 
-# Health check endpoint
+# HTTP Routes
 @app.route("/health")
 def health():
     return "OK", 200
 
-# TwiML endpoint for Twilio to start the stream
 @app.route("/twiml", methods=["POST"])
 def twiml():
+    # Twilio hits this to get TwiML
     ws_url = f"wss://{TWILIO_APP_HOST}/ws"
-    twiml_response = (
-        "<Response>"
-        f"<Start><Stream url=\"{ws_url}\"/></Start>"
-        "<Say>Du kopplas nu till vår AI-agent.</Say>"
-        "</Response>"
-    )
-    return Response(twiml_response, mimetype="text/xml")
+    resp = f""
+<Response>
+  <Start><Stream url="{ws_url}"/></Start>
+  <Say>Du kopplas nu till vår AI-agent.</Say>
+</Response>
+""
+    return Response(resp, mimetype="text/xml")
 
-# Audio conversion helpers
+# Helper functions replacing deprecated audioop with numpy
 
-def ulaw_to_pcm(raw_audio: bytes) -> bytes:
-    return audioop.ulaw2lin(raw_audio, 2)
+def ulaw_to_pcm(ulaw_bytes):
+    ulaw = np.frombuffer(ulaw_bytes, dtype=np.uint8)
+    ulaw = ulaw.astype(np.int16)
 
-def pcm_to_ulaw(pcm_audio: bytes) -> bytes:
-    return audioop.lin2ulaw(pcm_audio, 2)
+    BIAS = 0x84
+    MULAW_MAX = 0x1FFF
 
-# Transcribe audio using Whisper
-async def transcribe_audio(wav_bytes: bytes) -> str:
+    sign = ~ulaw & 0x80
+    exponent = (ulaw >> 4) & 0x07
+    mantissa = ulaw & 0x0F
+    magnitude = ((mantissa << 4) + 0x08) << exponent
+    pcm = (magnitude - BIAS) * np.where(sign == 0, 1, -1)
+
+    return pcm.astype(np.int16).tobytes()
+
+def pcm_to_ulaw(pcm_bytes):
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+    BIAS = 0x84
+    CLIP = 32635
+
+    pcm = np.clip(pcm, -CLIP, CLIP)
+    sign = (pcm >> 8) & 0x80
+    pcm = np.where(sign != 0, -pcm, pcm)
+    pcm = pcm + BIAS
+
+    exponent = np.zeros_like(pcm)
+    exp_lut = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
+    for i in range(7, 0, -1):
+        exponent = np.where(pcm >= exp_lut[i], i, exponent)
+
+    mantissa = (pcm >> (exponent + 3)) & 0x0F
+    ulaw = ~(sign | (exponent << 4) | mantissa)
+
+    return ulaw.astype(np.uint8).tobytes()
+
+# Async wrappers for OpenAI API calls
+
+async def transcribe(wav_bytes):
     try:
         transcript = openai.Audio.transcribe("whisper-1", io.BytesIO(wav_bytes))
         return transcript["text"]
@@ -78,49 +106,44 @@ async def transcribe_audio(wav_bytes: bytes) -> str:
         print("Whisper error:", e)
         return ""
 
-# Get ChatGPT response
-async def get_chatgpt_response(conv: list) -> str:
+async def chatgpt_reply(conv):
     try:
         res = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=conv,
-            temperature=0.7
+            temperature=0.7,
         )
         return res["choices"][0]["message"]["content"]
     except Exception as e:
-        print("ChatGPT error:", e)
+        print("GPT error:", e)
         return "Jag kan inte svara just nu."
 
-# Generate streamed TTS audio
-def tts_stream(text: str):
+def tts_stream(text):
     return elevenlabs_client.generate(
         text=text,
         voice=ELEVEN_VOICE,
         model=ELEVEN_MODEL,
-        stream=True
+        stream=True,
     )
 
-# WebSocket handler for Twilio <Stream>
+# WebSocket Route
 @sock.route("/ws")
-def websocket_handler(ws):
+def ws(ws):
     call_sid = None
     buffer_pcm = bytearray()
-
     while True:
         msg = ws.receive()
         if msg is None:
             break
-
         packet = json.loads(msg)
 
-        # Handle start event
+        # Start event
         if not call_sid and packet.get("start"):
             call_sid = packet["start"]["callSid"]
             conversations[call_sid] = [SYSTEM_PROMPT]
-            print(f"Call SID: {call_sid}")
             continue
 
-        # Handle media packets
+        # Media event
         media = packet.get("media")
         if media:
             raw = base64.b64decode(media["payload"])
@@ -128,43 +151,35 @@ def websocket_handler(ws):
             buffer_pcm.extend(pcm)
 
             # Process every ~5 seconds of audio
-            bytes_per_second = SAMPLE_RATE * CHANNELS * 2
-            if len(buffer_pcm) >= bytes_per_second * 5:
-                # Convert PCM buffer to WAV bytes
-                segment = AudioSegment(
+            if len(buffer_pcm) >= SAMPLE_RATE * 2 * 5:  # 5 seconds * 2 bytes per sample
+                seg = AudioSegment(
                     buffer_pcm,
                     frame_rate=SAMPLE_RATE,
                     sample_width=2,
-                    channels=CHANNELS
+                    channels=CHANNELS,
                 )
                 wav_io = io.BytesIO()
-                segment.export(wav_io, format="wav")
-                wav_bytes = wav_io.getvalue()
+                seg.export(wav_io, format="wav")
                 buffer_pcm.clear()
 
                 # Transcribe
-                transcription = asyncio.run(transcribe_audio(wav_bytes))
-                print("Transcribed:", transcription)
-                if transcription.strip():
-                    conversations[call_sid].append({"role": "user", "content": transcription})
+                text = asyncio.run(transcribe(wav_io.getvalue()))
 
-                    # ChatGPT reply
-                    reply = asyncio.run(get_chatgpt_response(conversations[call_sid]))
+                if text.strip():
+                    conversations[call_sid].append({"role": "user", "content": text})
+                    reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
                     conversations[call_sid].append({"role": "assistant", "content": reply})
-                    print("GPT reply:", reply)
 
-                    # TTS and send back
+                    # TTS stream back to Twilio
                     for chunk in tts_stream(reply):
-                        seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
-                        seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
-                        mu_law = pcm_to_ulaw(seg.raw_data)
-                        b64 = base64.b64encode(mu_law).decode("ascii")
+                        seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+                        seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
+                        mu = pcm_to_ulaw(seg2.raw_data)
+                        b64 = base64.b64encode(mu).decode()
                         ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
 
-                    # Signal end of message
                     ws.send(json.dumps({"event": "stop"}))
-
-    print("WebSocket connection closed")
+    print("WebSocket closed")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
