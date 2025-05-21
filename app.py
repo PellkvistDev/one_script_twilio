@@ -11,7 +11,7 @@ import openai
 from elevenlabs import ElevenLabs
 
 # Initialize OpenAI and ElevenLabs clients
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Eller ersätt med din nyckel direkt
 elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
 # Flask app setup
@@ -91,7 +91,7 @@ def pcm_to_ulaw(pcm_bytes):
 
 async def transcribe(wav_bytes):
     try:
-        transcript = openai.Audio.transcribe("whisper-1", io.BytesIO(wav_bytes))
+        transcript = client.Audio.transcribe("whisper-1", io.BytesIO(wav_bytes))
         return transcript["text"]
     except Exception as e:
         print("Whisper error:", e)
@@ -99,7 +99,7 @@ async def transcribe(wav_bytes):
 
 async def chatgpt_reply(conv):
     try:
-        res = openai.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=conv,
             temperature=0.7,
