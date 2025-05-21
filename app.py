@@ -10,55 +10,44 @@ from pydub import AudioSegment
 import openai
 from elevenlabs import ElevenLabs
 
-# Load environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g., "your-app.onrender.com"
+TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g., your-app.onrender.com
 
-# Initialize clients
 openai.api_key = OPENAI_API_KEY
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
-# Flask app and WebSocket
 app = Flask(__name__)
 sock = Sock(app)
 
-# Audio settings
 SAMPLE_RATE = 8000
 CHANNELS = 1
 
-# ElevenLabs TTS settings
 ELEVEN_VOICE = "bVMeCyTHy58xNoL34h3p"
 ELEVEN_MODEL = "eleven_flash_v2"
 
-# System prompt
 SYSTEM_PROMPT = {"role": "system", "content": (
     "Du ringer ett cold call och ska sälja en höbal. "
     "Du ringer från Theos höbalar AB och du heter Mohammed. "
     "Sälj den för två hundra tusen kronor."
 )}
 
-# Conversation state per call
 conversations = {}
 
-# HTTP Routes
 @app.route("/health")
 def health():
     return "OK", 200
 
 @app.route("/twiml", methods=["POST"])
 def twiml():
-    # Twilio hits this to get TwiML
     ws_url = f"wss://{TWILIO_APP_HOST}/ws"
-    resp = f""
-<Response>
-  <Start><Stream url="{ws_url}"/></Start>
-  <Say>Du kopplas nu till vår AI-agent.</Say>
-</Response>
-""
+    resp = (
+        f"<Response>"
+        f"<Start><Stream url=\"{ws_url}\"/></Start>"
+        f"<Say>Du kopplas nu till vår AI-agent.</Say>"
+        f"</Response>"
+    )
     return Response(resp, mimetype="text/xml")
-
-# Helper functions replacing deprecated audioop with numpy
 
 def ulaw_to_pcm(ulaw_bytes):
     ulaw = np.frombuffer(ulaw_bytes, dtype=np.uint8)
@@ -96,8 +85,6 @@ def pcm_to_ulaw(pcm_bytes):
 
     return ulaw.astype(np.uint8).tobytes()
 
-# Async wrappers for OpenAI API calls
-
 async def transcribe(wav_bytes):
     try:
         transcript = openai.Audio.transcribe("whisper-1", io.BytesIO(wav_bytes))
@@ -126,7 +113,6 @@ def tts_stream(text):
         stream=True,
     )
 
-# WebSocket Route
 @sock.route("/ws")
 def ws(ws):
     call_sid = None
@@ -137,21 +123,18 @@ def ws(ws):
             break
         packet = json.loads(msg)
 
-        # Start event
         if not call_sid and packet.get("start"):
             call_sid = packet["start"]["callSid"]
             conversations[call_sid] = [SYSTEM_PROMPT]
             continue
 
-        # Media event
         media = packet.get("media")
         if media:
             raw = base64.b64decode(media["payload"])
             pcm = ulaw_to_pcm(raw)
             buffer_pcm.extend(pcm)
 
-            # Process every ~5 seconds of audio
-            if len(buffer_pcm) >= SAMPLE_RATE * 2 * 5:  # 5 seconds * 2 bytes per sample
+            if len(buffer_pcm) >= SAMPLE_RATE * 2 * 5:
                 seg = AudioSegment(
                     buffer_pcm,
                     frame_rate=SAMPLE_RATE,
@@ -162,7 +145,6 @@ def ws(ws):
                 seg.export(wav_io, format="wav")
                 buffer_pcm.clear()
 
-                # Transcribe
                 text = asyncio.run(transcribe(wav_io.getvalue()))
 
                 if text.strip():
@@ -170,7 +152,6 @@ def ws(ws):
                     reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
                     conversations[call_sid].append({"role": "assistant", "content": reply})
 
-                    # TTS stream back to Twilio
                     for chunk in tts_stream(reply):
                         seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                         seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
