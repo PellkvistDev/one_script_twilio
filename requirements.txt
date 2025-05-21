@@ -5,3 +5,4 @@ elevenlabs
 websockets
 gunicorn
 pydub
+flask-sock
