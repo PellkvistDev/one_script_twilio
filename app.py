@@ -151,13 +151,23 @@ async def ws_handler(websocket):
     except Exception as e:
         print("WebSocket error:", e)
 
-# Start WebSocket server in thread
+# Only allow GET requests on the WebSocket
+async def reject_non_get_requests(path, request_headers):
+    if request_headers.get("Method", "").upper() != "GET":
+        return (http.HTTPStatus.METHOD_NOT_ALLOWED, [], b"Method Not Allowed\n")
+
 def start_websocket_server():
     async def server():
         print("WebSocket server running on port 8765")
-        async with websockets.serve(ws_handler, "0.0.0.0", 8765, process_request=reject_head):
-            await asyncio.Future()
+        async with websockets.serve(
+            ws_handler,
+            "0.0.0.0",
+            8765,
+            process_request=reject_non_get_requests,
+        ):
+            await asyncio.Future()  # Keep running
     asyncio.run(server())
+
 
 # Workaround to reject HEAD requests (Render/health check)
 async def reject_head(path, request_headers):
