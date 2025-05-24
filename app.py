@@ -9,6 +9,7 @@ from flask_sock import Sock
 from pydub import AudioSegment
 from openai import OpenAI
 from elevenlabs import ElevenLabs
+from twilio.twiml.voice_response import Connect, VoiceResponse, Say, Stream
 
 # Load environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -53,13 +54,13 @@ def health():
 
 @app.route("/twiml", methods=["POST"])
 def twiml():
-    ws_url = f"wss://{TWILIO_APP_HOST}/ws"
+    ws_url = f"wss://one-script-twilio.onrender.com/ws"
     resp = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<Response>\n'
-        '    <Start>\n'
+        '    <Connect>\n'
         f'        <Stream url="{ws_url}" />\n'
-        '    </Start>\n'
+        '    </Connect>\n'
         '    <Say>Du kopplas nu till vår AI-agent.</Say>\n'
         '</Response>'
     )
