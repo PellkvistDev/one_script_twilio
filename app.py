@@ -47,14 +47,18 @@ def health():
 
 @app.route("/twiml", methods=["POST"])
 def twiml():
+    print("Received /twiml POST request")
     ws_url = f"wss://{TWILIO_APP_HOST}/ws"
-    print(f"[TWIML] Generated WebSocket URL: {ws_url}")
-    resp = f""
-<Response>
-  <Start><Stream url="{ws_url}" /></Start>
-  <Say>Du kopplas nu till vår AI-agent.</Say>
-</Response>
-""
+    resp = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        f'    <Start>\n'
+        f'        <Stream url="{ws_url}" />\n'
+        f'    </Start>\n'
+        '    <Say>Du kopplas nu till vår AI-agent.</Say>\n'
+        '</Response>'
+    )
+    print("TwiML Response:\n", resp)
     return Response(resp, mimetype="text/xml")
 
 def ulaw_to_pcm(raw):
