@@ -3,43 +3,74 @@ import io
 import json
 import base64
 import asyncio
-import time
 import numpy as np
 from flask import Flask, request, Response
 from flask_sock import Sock
 from pydub import AudioSegment
-import openai
+from openai import OpenAI
 from elevenlabs import ElevenLabs
 
 # Load environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")
+TWILIO_APP_HOST = os.getenv("TWILIO_APP_HOST")  # e.g., "your-app.onrender.com"
 
 # Initialize clients
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Eller ersätt med din nyckel direkt
+client = OpenAI(api_key=OPENAI_API_KEY)
 elevenlabs_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
 
+# Flask app and WebSocket
 app = Flask(__name__)
 sock = Sock(app)
 
+# Audio settings
 SAMPLE_RATE = 8000
 CHANNELS = 1
+
+# ElevenLabs TTS settings
 ELEVEN_VOICE = "bVMeCyTHy58xNoL34h3p"
 ELEVEN_MODEL = "eleven_flash_v2"
 
-SYSTEM_PROMPT = {"role": "system", "content": (
-    "Du ringer ett cold call och ska sälja en höbal. "
-    "Du ringer från Theos höbalar AB och du heter Mohammed. "
-    "Sälj den för två hundra tusen kronor."
-)}
+# System prompt for ChatGPT
+SYSTEM_PROMPT = {
+    "role": "system",
+    "content": (
+        "Du ringer ett cold call och ska sälja en höbal. "
+        "Du ringer från Theos höbalar AB och du heter Mohammed. "
+        "Sälj den för två hundra tusen kronor."
+    )
+}
 
+# Conversation state per call
 conversations = {}
+
+# Silence timeout in seconds before sending fake 'hej'
+SILENCE_TIMEOUT = 4.5
+
+@app.route("/health")
+def health():
+    return "OK", 200
+
+@app.route("/twiml", methods=["POST"])
+def twiml():
+    ws_url = f"wss://{TWILIO_APP_HOST}/ws"
+    resp = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Response>\n'
+        '    <Start>\n'
+        f'        <Stream url="{ws_url}" />\n'
+        '    </Start>\n'
+        '    <Say>Du kopplas nu till vår AI-agent.</Say>\n'
+        '</Response>'
+    )
+    return Response(resp, mimetype="text/xml")
 
 def ulaw_to_pcm(ulaw_bytes):
     ulaw = np.frombuffer(ulaw_bytes, dtype=np.uint8)
     ulaw = ulaw.astype(np.int16)
 
     BIAS = 0x84
+    MULAW_MAX = 0x1FFF
 
     sign = ~ulaw & 0x80
     exponent = (ulaw >> 4) & 0x07
@@ -102,129 +133,108 @@ def tts_stream(text):
         stream=True,
     )
 
-def generate_silence_chunk(duration_ms=250):
-    """Generate a silent audio chunk in u-law encoded bytes for given duration."""
-    silent_audio = AudioSegment.silent(duration=duration_ms, frame_rate=SAMPLE_RATE)
-    raw_pcm = silent_audio.set_channels(CHANNELS).set_sample_width(2).raw_data
-    mu = pcm_to_ulaw(raw_pcm)
-    b64 = base64.b64encode(mu).decode()
-    return b64
-
-@app.route("/health")
-def health():
-    return "OK", 200
-
-@app.route("/twiml", methods=["POST"])
-def twiml():
-    ws_url = f"wss://{TWILIO_APP_HOST}/ws"
-    resp = (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<Response>\n'
-        f'    <Start>\n'
-        f'        <Stream url="{ws_url}" />\n'
-        f'    </Start>\n'
-        '    <Say>Du kopplas nu till vår AI-agent.</Say>\n'
-        '</Response>'
-    )
-    return Response(resp, mimetype="text/xml")
-
 @sock.route("/ws")
 def ws(ws):
     call_sid = None
     buffer_pcm = bytearray()
-    last_speech_time = time.time()
-    silence_timeout = 4.5  # seconds
-    fake_user_sent = False
+    last_audio_time = asyncio.get_event_loop().time()
 
     print("[WebSocket] Connected")
 
-    while True:
-        msg = ws.receive()
-        now = time.time()
-
-        if msg is None:
-            print("[WebSocket] Disconnected")
-            break
-
-        packet = json.loads(msg)
-
-        if not call_sid and packet.get("start"):
-            call_sid = packet["start"]["callSid"]
-            print(f"[Call Start] SID: {call_sid}")
-            conversations[call_sid] = [SYSTEM_PROMPT]
-
-            # Initial fake user input "hej"
+    async def send_fake_hej():
+        nonlocal last_audio_time
+        if call_sid is None:
+            return
+        now = asyncio.get_event_loop().time()
+        if now - last_audio_time >= SILENCE_TIMEOUT:
+            print("[Silence] No audio received, sending fake 'hej'")
             conversations[call_sid].append({"role": "user", "content": "hej"})
-            reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
+            reply = await chatgpt_reply(conversations[call_sid])
             conversations[call_sid].append({"role": "assistant", "content": reply})
 
-            # Send TTS greeting audio
             for chunk in tts_stream(reply):
                 seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
                 seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
                 mu = pcm_to_ulaw(seg.raw_data)
                 b64 = base64.b64encode(mu).decode()
                 ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
-            ws.send(json.dumps({"event": "mark", "name": "greeting_sent"}))
-            last_speech_time = now
-            fake_user_sent = False
-            continue
 
-        media = packet.get("media")
-        if media:
-            last_speech_time = now  # Reset silence timer
-            raw = base64.b64decode(media["payload"])
-            pcm = ulaw_to_pcm(raw)
-            buffer_pcm.extend(pcm)
+            last_audio_time = now
 
-            # Process every 1 second of audio or more
-            if len(buffer_pcm) >= SAMPLE_RATE * 2 * 1:
-                seg = AudioSegment(
-                    buffer_pcm,
-                    frame_rate=SAMPLE_RATE,
-                    sample_width=2,
-                    channels=CHANNELS,
-                )
-                wav_io = io.BytesIO()
-                seg.export(wav_io, format="wav")
-                buffer_pcm.clear()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-                text = asyncio.run(transcribe(wav_io.getvalue()))
-                if text.strip():
-                    conversations[call_sid].append({"role": "user", "content": text})
-                    reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
-                    conversations[call_sid].append({"role": "assistant", "content": reply})
+    try:
+        while True:
+            msg = ws.receive()
+            if msg is None:
+                print("[WebSocket] Disconnected")
+                break
 
-                    for chunk in tts_stream(reply):
-                        seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
-                        seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
-                        mu = pcm_to_ulaw(seg2.raw_data)
-                        b64 = base64.b64encode(mu).decode()
-                        ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
+            packet = json.loads(msg)
 
-                fake_user_sent = False  # Reset flag if user actually spoke
+            if not call_sid and packet.get("start"):
+                call_sid = packet["start"]["callSid"]
+                print(f"[Call Start] SID: {call_sid}")
+                conversations[call_sid] = [SYSTEM_PROMPT]
 
-        # Check silence timeout and if no fake user message was sent recently
-        if now - last_speech_time > silence_timeout and not fake_user_sent and call_sid:
-            print("[Silence] No user speech detected, sending fake input 'hej'")
-            conversations[call_sid].append({"role": "user", "content": "hej"})
-            reply = asyncio.run(chatgpt_reply(conversations[call_sid]))
-            conversations[call_sid].append({"role": "assistant", "content": reply})
+                # Inject fake greeting immediately so call won't hang up
+                conversations[call_sid].append({"role": "user", "content": "hej"})
+                reply = loop.run_until_complete(chatgpt_reply(conversations[call_sid]))
+                conversations[call_sid].append({"role": "assistant", "content": reply})
 
-            for chunk in tts_stream(reply):
-                seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
-                seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
-                mu = pcm_to_ulaw(seg2.raw_data)
-                b64 = base64.b64encode(mu).decode()
-                ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
+                for chunk in tts_stream(reply):
+                    seg = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+                    seg = seg.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
+                    mu = pcm_to_ulaw(seg.raw_data)
+                    b64 = base64.b64encode(mu).decode()
+                    ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
+                ws.send(json.dumps({"event": "mark", "name": "greeting_sent"}))
+                last_audio_time = loop.time()
+                continue
 
-            last_speech_time = now
-            fake_user_sent = True
+            media = packet.get("media")
+            if media:
+                raw = base64.b64decode(media["payload"])
+                pcm = ulaw_to_pcm(raw)
+                buffer_pcm.extend(pcm)
+                last_audio_time = loop.time()
 
-        # Optional: send tiny silent chunks every second to keep connection alive
-        # Could be added here if needed.
+                if len(buffer_pcm) >= SAMPLE_RATE * 2 * 5:  # 5 seconds of audio
+                    print("[Audio] Processing 5s chunk")
+                    seg = AudioSegment(
+                        buffer_pcm,
+                        frame_rate=SAMPLE_RATE,
+                        sample_width=2,
+                        channels=CHANNELS,
+                    )
+                    wav_io = io.BytesIO()
+                    seg.export(wav_io, format="wav")
+                    buffer_pcm.clear()
 
-    print("[WebSocket] Connection closed")
+                    text = loop.run_until_complete(transcribe(wav_io.getvalue()))
+                    if text.strip():
+                        conversations[call_sid].append({"role": "user", "content": text})
+                        reply = loop.run_until_complete(chatgpt_reply(conversations[call_sid]))
+                        conversations[call_sid].append({"role": "assistant", "content": reply})
+
+                        for chunk in tts_stream(reply):
+                            seg2 = AudioSegment.from_file(io.BytesIO(chunk), format="mp3")
+                            seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
+                            mu = pcm_to_ulaw(seg2.raw_data)
+                            b64 = base64.b64encode(mu).decode()
+                            ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
+
+            else:
+                # Check silence timeout periodically
+                loop.run_until_complete(send_fake_hej())
+
+    except Exception as e:
+        print("[WebSocket] Error:", e)
+
+    print("[WebSocket] Session ended")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    print(f"[Server] Listening on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=True)
