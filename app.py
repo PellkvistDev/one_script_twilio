@@ -142,6 +142,7 @@ def ws(ws):
                 seg2 = seg2.set_frame_rate(SAMPLE_RATE).set_channels(CHANNELS).set_sample_width(2)
                 mu = pcm_to_ulaw(seg2.raw_data)
                 b64 = base64.b64encode(mu).decode()
+                print("Sending audio chunk!")
                 ws.send(json.dumps({"event": "media", "media": {"payload": b64}}))
             continue
 
