@@ -61,11 +61,41 @@ def twiml():
     print("TwiML Response:\n", resp)
     return Response(resp, mimetype="text/xml")
 
-def ulaw_to_pcm(raw):
-    return audioop.ulaw2lin(raw, 2)
+def ulaw_to_pcm(ulaw_bytes):
+    ulaw = np.frombuffer(ulaw_bytes, dtype=np.uint8)
+    ulaw = ulaw.astype(np.int16)
 
-def pcm_to_ulaw(pcm):
-    return audioop.lin2ulaw(pcm, 2)
+    BIAS = 0x84
+    MULAW_MAX = 0x1FFF
+
+    sign = ~ulaw & 0x80
+    exponent = (ulaw >> 4) & 0x07
+    mantissa = ulaw & 0x0F
+    magnitude = ((mantissa << 4) + 0x08) << exponent
+    pcm = (magnitude - BIAS) * np.where(sign == 0, 1, -1)
+
+    return pcm.astype(np.int16).tobytes()
+
+def pcm_to_ulaw(pcm_bytes):
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16)
+
+    BIAS = 0x84
+    CLIP = 32635
+
+    pcm = np.clip(pcm, -CLIP, CLIP)
+    sign = (pcm >> 8) & 0x80
+    pcm = np.where(sign != 0, -pcm, pcm)
+    pcm = pcm + BIAS
+
+    exponent = np.zeros_like(pcm)
+    exp_lut = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
+    for i in range(7, 0, -1):
+        exponent = np.where(pcm >= exp_lut[i], i, exponent)
+
+    mantissa = (pcm >> (exponent + 3)) & 0x0F
+    ulaw = ~(sign | (exponent << 4) | mantissa)
+
+    return ulaw.astype(np.uint8).tobytes()
 
 async def transcribe(wav_bytes):
     try:
